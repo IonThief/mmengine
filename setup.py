@@ -138,7 +138,7 @@ setup(
     python_requires='>=3.7',
     install_requires=install_requires,
     extras_require={
-        'all': parse_requirements('requirements.txt'),
-        'tests': parse_requirements('requirements/tests.txt'),
+        'all': parse_requirements('requirements.txt'),  # type: ignore
+        'tests': parse_requirements('requirements/tests.txt'),  # type: ignore
     },
 )
