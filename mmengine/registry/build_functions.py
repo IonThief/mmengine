@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 from mmengine.config import Config, ConfigDict
 from mmengine.utils import ManagerMixin, digit_version
+from .object_hub import ObjectHub
 from .registry import Registry
 
 if TYPE_CHECKING:
@@ -15,9 +16,10 @@ if TYPE_CHECKING:
 
 
 def build_from_cfg(
-        cfg: Union[dict, ConfigDict, Config],
-        registry: Registry,
-        default_args: Optional[Union[dict, ConfigDict, Config]] = None) -> Any:
+    cfg: Union[dict, ConfigDict, Config],
+    registry: Registry,
+    default_args: Optional[Union[dict, ConfigDict, Config]] = None,
+) -> Any:
     """Build a module from config dict when it is a class configuration, or
     call a function from config dict when it is a function configuration.
 
@@ -63,6 +65,15 @@ def build_from_cfg(
     # Avoid circular import
     from ..logging import print_log
 
+    if isinstance(cfg, str) and cfg.startswith('@'):
+        try:
+            hub = ObjectHub.get_current_instance()
+            return hub.resolve(cfg[1:])
+        except RuntimeError:
+            raise RuntimeError(
+                f"Failed to resolve reference '{cfg}'. "
+                'No active ObjectHub found. Ensure a Runner is initialized.')
+
     if not isinstance(cfg, (dict, ConfigDict, Config)):
         raise TypeError(
             f'cfg should be a dict, ConfigDict or Config, but got {type(cfg)}')
@@ -87,6 +98,22 @@ def build_from_cfg(
     if default_args is not None:
         for name, value in default_args.items():
             args.setdefault(name, value)
+
+    alias = args.pop('_alias_', None)
+
+    for k, v in args.items():
+        if isinstance(v, str) and v.startswith('@'):
+            try:
+                args[k] = ObjectHub.get_current_instance().resolve(v[1:])
+            except RuntimeError:
+                raise RuntimeError(f"Failed to resolve argument '{k}={v}'."
+                                   'No active ObjectHub found.')
+
+        elif isinstance(v, dict) and 'type' in v:
+            try:
+                args[k] = build_from_cfg(v, registry)
+            except Exception as e:
+                raise type(e)(f"Failed to build argument '{k}': {e}") from e
 
     # Instance should be built under target scope, if `_scope_` is defined
     # in cfg, current default scope should switch to specified scope
@@ -114,8 +141,8 @@ def build_from_cfg(
         # If `obj_cls` inherits from `ManagerMixin`, it should be
         # instantiated by `ManagerMixin.get_instance` to ensure that it
         # can be accessed globally.
-        if inspect.isclass(obj_cls) and \
-                issubclass(obj_cls, ManagerMixin):  # type: ignore
+        if inspect.isclass(obj_cls) and issubclass(
+                obj_cls, ManagerMixin):  # type: ignore
             obj = obj_cls.get_instance(**args)  # type: ignore
         else:
             obj = obj_cls(**args)  # type: ignore
@@ -127,13 +154,22 @@ def build_from_cfg(
                 'registry, and its implementation can be found in '
                 f'{obj_cls.__module__}',  # type: ignore
                 logger='current',
-                level=logging.DEBUG)
+                level=logging.DEBUG,
+            )
         else:
             print_log(
                 'An instance is built from registry, and its constructor '
                 f'is {obj_cls}',
                 logger='current',
-                level=logging.DEBUG)
+                level=logging.DEBUG,
+            )
+
+        if alias is not None:
+            try:
+                ObjectHub.get_current_instance().register(alias, obj)
+            except RuntimeError:
+                pass
+
         return obj
 
 
@@ -167,9 +203,10 @@ def build_runner_from_cfg(cfg: Union[dict, ConfigDict, Config],
         cfg,
         (dict, ConfigDict, Config
          )), f'cfg should be a dict, ConfigDict or Config, but got {type(cfg)}'
-    assert isinstance(
-        registry, Registry), ('registry should be a mmengine.Registry object',
-                              f'but got {type(registry)}')
+    assert isinstance(registry, Registry), (
+        'registry should be a mmengine.Registry object',
+        f'but got {type(registry)}',
+    )
 
     args = cfg.copy()
     # Runner should be built under target scope, if `_scope_` is defined
@@ -199,14 +236,15 @@ def build_runner_from_cfg(cfg: Union[dict, ConfigDict, Config],
             'registry, its implementation can be found in'
             f'{runner_cls.__module__}',  # type: ignore
             logger='current',
-            level=logging.DEBUG)
+            level=logging.DEBUG,
+        )
         return runner
 
 
 def build_model_from_cfg(
     cfg: Union[dict, ConfigDict, Config],
     registry: Registry,
-    default_args: Optional[Union[dict, 'ConfigDict', 'Config']] = None
+    default_args: Optional[Union[dict, 'ConfigDict', 'Config']] = None,
 ) -> 'nn.Module':
     """Build a PyTorch model from config dict(s). Different from
     ``build_from_cfg``, if cfg is a list, a ``nn.Sequential`` will be built.
@@ -223,6 +261,7 @@ def build_model_from_cfg(
         nn.Module: A built nn.Module.
     """
     from ..model import Sequential
+
     if isinstance(cfg, list):
         modules = [
             build_from_cfg(_cfg, registry, default_args) for _cfg in cfg
@@ -233,15 +272,16 @@ def build_model_from_cfg(
 
 
 def build_optimizer_from_cfg(
-        cfg: Union[dict, ConfigDict, Config],
-        registry: Registry,
-        default_args: Optional[Union[dict, ConfigDict, Config]] = None) -> Any:
+    cfg: Union[dict, ConfigDict, Config],
+    registry: Registry,
+    default_args: Optional[Union[dict, ConfigDict, Config]] = None,
+) -> Any:
     import torch
 
     from ..logging import print_log
-    if 'type' in cfg \
-            and 'Adafactor' == cfg['type'] \
-            and digit_version(torch.__version__) >= digit_version('2.5.0'):
+
+    if ('type' in cfg and 'Adafactor' == cfg['type']
+            and digit_version(torch.__version__) >= digit_version('2.5.0')):
         print_log(
             'the torch version of Adafactor is registered as TorchAdafactor')
     return build_from_cfg(cfg, registry, default_args)
@@ -250,7 +290,7 @@ def build_optimizer_from_cfg(
 def build_scheduler_from_cfg(
     cfg: Union[dict, ConfigDict, Config],
     registry: Registry,
-    default_args: Optional[Union[dict, ConfigDict, Config]] = None
+    default_args: Optional[Union[dict, ConfigDict, Config]] = None,
 ) -> '_ParamScheduler':
     """Builds a ``ParamScheduler`` instance from config.
 
@@ -276,9 +316,10 @@ def build_scheduler_from_cfg(
         cfg,
         (dict, ConfigDict, Config
          )), f'cfg should be a dict, ConfigDict or Config, but got {type(cfg)}'
-    assert isinstance(
-        registry, Registry), ('registry should be a mmengine.Registry object',
-                              f'but got {type(registry)}')
+    assert isinstance(registry, Registry), (
+        'registry should be a mmengine.Registry object',
+        f'but got {type(registry)}',
+    )
 
     args = cfg.copy()
     if default_args is not None:
@@ -306,8 +347,7 @@ def build_scheduler_from_cfg(
             else:
                 raise TypeError('type must be a str or valid type, but got '
                                 f'{type(scheduler_type)}')
-            return scheduler_cls.build_iter_from_epoch(  # type: ignore
-                **args)
+            return scheduler_cls.build_iter_from_epoch(**args)  # type: ignore
         else:
             args.pop('epoch_length', None)
             return build_from_cfg(args, registry)
