@@ -36,7 +36,7 @@ from mmengine.optim import (OptimWrapper, OptimWrapperDict, _ParamScheduler,
 from mmengine.registry import (DATA_SAMPLERS, DATASETS, EVALUATOR, FUNCTIONS,
                                HOOKS, LOG_PROCESSORS, LOOPS, MODEL_WRAPPERS,
                                MODELS, OPTIM_WRAPPERS, PARAM_SCHEDULERS,
-                               RUNNERS, VISUALIZERS, DefaultScope)
+                               RUNNERS, VISUALIZERS, DefaultScope, ObjectHub)
 from mmengine.utils import apply_to, digit_version, get_git_hash, is_seq_of
 from mmengine.utils.dl_utils import (TORCH_VERSION, collect_env,
                                      set_multi_processing)
@@ -254,6 +254,7 @@ class Runner:
         >>> runner.train()
         >>> runner.test()
     """
+
     cfg: Config
     _train_loop: Optional[Union[BaseLoop, Dict]]
     _val_loop: Optional[Union[BaseLoop, Dict]]
@@ -382,6 +383,12 @@ class Runner:
             self._experiment_name = f'{filename_no_ext}_{self._timestamp}'
         else:
             self._experiment_name = self.timestamp
+
+        # register self to the global object hub
+        self.object_hub = ObjectHub.get_instance(self._experiment_name)
+        self.object_hub.clear()
+        self.object_hub.register('runner', self)
+
         self._log_dir = osp.join(self.work_dir, self.timestamp)
         mmengine.mkdir_or_exist(self._log_dir)
         # Used to reset registries location. See :meth:`Registry.build` for
@@ -686,12 +693,14 @@ class Runner:
         # set resource limit
         if platform.system() != 'Windows':
             import resource
+
             rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
             base_soft_limit = rlimit[0]
             hard_limit = rlimit[1]
             soft_limit = min(
                 max(env_cfg.get('resource_limit', 4096), base_soft_limit),
-                hard_limit)
+                hard_limit,
+            )
             resource.setrlimit(resource.RLIMIT_NOFILE,
                                (soft_limit, hard_limit))
 
@@ -716,12 +725,15 @@ class Runner:
         self._seed = set_random_seed(
             seed=seed,
             deterministic=deterministic,
-            diff_rank_seed=diff_rank_seed)
+            diff_rank_seed=diff_rank_seed,
+        )
 
-    def build_logger(self,
-                     log_level: Union[int, str] = 'INFO',
-                     log_file: Optional[str] = None,
-                     **kwargs) -> MMLogger:
+    def build_logger(
+        self,
+        log_level: Union[int, str] = 'INFO',
+        log_file: Optional[str] = None,
+        **kwargs,
+    ) -> MMLogger:
         """Build a global asscessable MMLogger.
 
         Args:
@@ -790,7 +802,8 @@ class Runner:
             visualizer = dict(
                 name=self._experiment_name,
                 vis_backends=[dict(type='LocalVisBackend')],
-                save_dir=self._log_dir)
+                save_dir=self._log_dir,
+            )
             return Visualizer.get_instance(**visualizer)
 
         if isinstance(visualizer, Visualizer):
@@ -899,15 +912,18 @@ class Runner:
                 module=model,
                 device_ids=[int(os.environ['LOCAL_RANK'])],
                 broadcast_buffers=False,
-                find_unused_parameters=find_unused_parameters)
+                find_unused_parameters=find_unused_parameters,
+            )
         else:
             model_wrapper_cfg.setdefault('type', 'MMDistributedDataParallel')
             model_wrapper_type = MODEL_WRAPPERS.get(
-                model_wrapper_cfg.get('type'))  # type: ignore
+                model_wrapper_cfg.get('type'),  # type: ignore
+            )
             default_args: dict = dict()
             if issubclass(
                     model_wrapper_type,  # type: ignore
-                    DistributedDataParallel):
+                    DistributedDataParallel,
+            ):
                 default_args['device_ids'] = [int(os.environ['LOCAL_RANK'])]
             default_args['module'] = model
             model = MODEL_WRAPPERS.build(
@@ -948,14 +964,16 @@ class Runner:
                 optimizer lr is based on. ``enable`` is the switch to turn on
                 and off the feature.
         """
-        if (auto_scale_lr is None or not auto_scale_lr.get('enable', False)):
+        if auto_scale_lr is None or not auto_scale_lr.get('enable', False):
             return None
 
-        assert 'base_batch_size' in auto_scale_lr, \
-            'Lack of `base_batch_size` in `auto_scale_lr`.'
+        assert (
+            'base_batch_size'
+            in auto_scale_lr), 'Lack of `base_batch_size` in `auto_scale_lr`.'
         dataloader: Union[DataLoader, Dict] = self._train_dataloader
-        bs = dataloader.batch_size if isinstance(
-            dataloader, DataLoader) else dataloader['batch_size']
+        bs = (
+            dataloader.batch_size if isinstance(dataloader, DataLoader) else
+            dataloader['batch_size'])
         real_bs = self.world_size * bs
         base_bs = auto_scale_lr['base_batch_size']
         ratio = float(real_bs) / float(base_bs)
@@ -965,8 +983,8 @@ class Runner:
 
         def _is_built(schedulers):
             if isinstance(schedulers, dict):
-                return False if 'type' in schedulers else any(
-                    _is_built(s) for s in schedulers.values())
+                return (False if 'type' in schedulers else any(
+                    _is_built(s) for s in schedulers.values()))
             if isinstance(schedulers, list):
                 return any(_is_built(s) for s in schedulers)
             return isinstance(schedulers, _ParamScheduler)
@@ -976,10 +994,12 @@ class Runner:
                                'ParamScheduler because ParamScheduler will '
                                'store initial lr from optimizer wrappers')
 
-        assert isinstance(optim_wrapper, OptimWrapper), \
-            '`scale_lr should be called after building OptimWrapper'
-        wrappers = list(optim_wrapper.values()) if isinstance(
-            optim_wrapper, OptimWrapperDict) else [optim_wrapper]
+        assert isinstance(
+            optim_wrapper, OptimWrapper
+        ), '`scale_lr should be called after building OptimWrapper'
+        wrappers = (
+            list(optim_wrapper.values()) if isinstance(
+                optim_wrapper, OptimWrapperDict) else [optim_wrapper])
         for wrapper in wrappers:
             for group in wrapper.optimizer.param_groups:
                 group['lr'] = group['lr'] * ratio
@@ -1134,8 +1154,10 @@ class Runner:
                             f'object or dict, but got {optim_wrapper}')
 
     def _build_param_scheduler(
-            self, scheduler: Union[_ParamScheduler, Dict, List],
-            optim_wrapper: OptimWrapper) -> List[_ParamScheduler]:
+        self,
+        scheduler: Union[_ParamScheduler, Dict, List],
+        optim_wrapper: OptimWrapper,
+    ) -> List[_ParamScheduler]:
         """Build parameter schedulers for a single optimizer.
 
         Args:
@@ -1168,8 +1190,9 @@ class Runner:
 
                 # Set default end
                 if isinstance(self._train_loop, BaseLoop):
-                    default_end = self.max_epochs if _scheduler.get(
-                        'by_epoch', True) else self.max_iters
+                    default_end = (
+                        self.max_epochs if _scheduler.get('by_epoch', True)
+                        else self.max_iters)
                     _scheduler.setdefault('end', default_end)
                     self.logger.debug(
                         f'The `end` of {_scheduler["type"]} is not set. '
@@ -1180,7 +1203,9 @@ class Runner:
                         _scheduler,
                         default_args=dict(
                             optimizer=optim_wrapper,
-                            epoch_length=len(self.train_dataloader))))
+                            epoch_length=len(self.train_dataloader),
+                        ),
+                    ))
             else:
                 raise TypeError(
                     'scheduler should be a _ParamScheduler object or dict, '
@@ -1325,9 +1350,11 @@ class Runner:
                 f', but got {evaluator}')
 
     @staticmethod
-    def build_dataloader(dataloader: Union[DataLoader, Dict],
-                         seed: Optional[int] = None,
-                         diff_rank_seed: bool = False) -> DataLoader:
+    def build_dataloader(
+        dataloader: Union[DataLoader, Dict],
+        seed: Optional[int] = None,
+        diff_rank_seed: bool = False,
+    ) -> DataLoader:
         """Build dataloader.
 
         The method builds three components:
@@ -1389,7 +1416,8 @@ class Runner:
             sampler_seed = None if diff_rank_seed else seed
             sampler = DATA_SAMPLERS.build(
                 sampler_cfg,
-                default_args=dict(dataset=dataset, seed=sampler_seed))
+                default_args=dict(dataset=dataset, seed=sampler_seed),
+            )
         else:
             # fallback to raise error in dataloader
             # if `sampler_cfg` is not a valid type
@@ -1404,7 +1432,9 @@ class Runner:
                 batch_sampler_cfg,
                 default_args=dict(
                     sampler=sampler,
-                    batch_size=dataloader_cfg.pop('batch_size')))
+                    batch_size=dataloader_cfg.pop('batch_size'),
+                ),
+            )
         else:
             # fallback to raise error in dataloader
             # if `batch_sampler_cfg` is not a valid type
@@ -1439,18 +1469,20 @@ class Runner:
                     num_workers=dataloader_cfg.get('num_workers'),
                     rank=get_rank(),
                     seed=seed,
-                    disable_subprocess_warning=disable_subprocess_warning)
+                    disable_subprocess_warning=disable_subprocess_warning,
+                )
             else:
                 init_fn = None
 
         # `persistent_workers` requires pytorch version >= 1.7
-        if ('persistent_workers' in dataloader_cfg
-                and digit_version(TORCH_VERSION) < digit_version('1.7.0')):
+        if 'persistent_workers' in dataloader_cfg and digit_version(
+                TORCH_VERSION) < digit_version('1.7.0'):
             print_log(
                 '`persistent_workers` is only available when '
                 'pytorch version >= 1.7',
                 logger='current',
-                level=logging.WARNING)
+                level=logging.WARNING,
+            )
             dataloader_cfg.pop('persistent_workers')
 
         # The default behavior of `collat_fn` in dataloader is to
@@ -1479,7 +1511,8 @@ class Runner:
             batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             worker_init_fn=init_fn,
-            **dataloader_cfg)
+            **dataloader_cfg,
+        )
         return data_loader
 
     def build_train_loop(self, loop: Union[BaseLoop, Dict]) -> BaseLoop:
@@ -1520,7 +1553,8 @@ class Runner:
             loop = LOOPS.build(
                 loop_cfg,
                 default_args=dict(
-                    runner=self, dataloader=self._train_dataloader))
+                    runner=self, dataloader=self._train_dataloader),
+            )
         else:
             by_epoch = loop_cfg.pop('by_epoch')
             if by_epoch:
@@ -1564,13 +1598,16 @@ class Runner:
                 default_args=dict(
                     runner=self,
                     dataloader=self._val_dataloader,
-                    evaluator=self._val_evaluator))
+                    evaluator=self._val_evaluator,
+                ),
+            )
         else:
             loop = ValLoop(
                 **loop_cfg,
                 runner=self,
-                dataloader=self._val_dataloader,
-                evaluator=self._val_evaluator)  # type: ignore
+                dataloader=self._val_dataloader,  # type: ignore
+                evaluator=self._val_evaluator,  # type: ignore
+            )
 
         return loop  # type: ignore
 
@@ -1606,13 +1643,16 @@ class Runner:
                 default_args=dict(
                     runner=self,
                     dataloader=self._test_dataloader,
-                    evaluator=self._test_evaluator))
+                    evaluator=self._test_evaluator,
+                ),
+            )
         else:
             loop = TestLoop(
                 **loop_cfg,
                 runner=self,
-                dataloader=self._test_dataloader,
-                evaluator=self._test_evaluator)  # type: ignore
+                dataloader=self._test_dataloader,  # type: ignore
+                evaluator=self._test_evaluator,  # type: ignore
+            )
 
         return loop  # type: ignore
 
@@ -1768,7 +1808,8 @@ class Runner:
         self.optim_wrapper.initialize_count_status(
             self.model,
             self._train_loop.iter,  # type: ignore
-            self._train_loop.max_iters)  # type: ignore
+            self._train_loop.max_iters,  # type: ignore
+        )
 
         # Maybe compile the model according to options in self.cfg.compile
         # This must be called **AFTER** model has been wrapped.
@@ -1841,9 +1882,10 @@ class Runner:
                     raise TypeError(f'{e} in {hook}') from None
 
     def register_hook(
-            self,
-            hook: Union[Hook, Dict],
-            priority: Optional[Union[str, int, Priority]] = None) -> None:
+        self,
+        hook: Union[Hook, Dict],
+        priority: Optional[Union[str, int, Priority]] = None,
+    ) -> None:
         """Register a hook into the hook list.
 
         The hook will be inserted into a priority queue, with the specified
@@ -1976,9 +2018,10 @@ class Runner:
             self.register_hook(hook)
 
     def register_hooks(
-            self,
-            default_hooks: Optional[Dict[str, Union[Hook, Dict]]] = None,
-            custom_hooks: Optional[List[Union[Hook, Dict]]] = None) -> None:
+        self,
+        default_hooks: Optional[Dict[str, Union[Hook, Dict]]] = None,
+        custom_hooks: Optional[List[Union[Hook, Dict]]] = None,
+    ) -> None:
         """Register default hooks and custom hooks into hook list.
 
         Args:
@@ -1994,11 +2037,13 @@ class Runner:
         if custom_hooks is not None:
             self.register_custom_hooks(custom_hooks)
 
-    def resume(self,
-               filename: str,
-               resume_optimizer: bool = True,
-               resume_param_scheduler: bool = True,
-               map_location: Union[str, Callable] = 'default') -> None:
+    def resume(
+        self,
+        filename: str,
+        resume_optimizer: bool = True,
+        resume_param_scheduler: bool = True,
+        map_location: Union[str, Callable] = 'default',
+    ) -> None:
         """Resume model from checkpoint.
 
         Args:
@@ -2031,8 +2076,8 @@ class Runner:
             if (previous_gpu_ids is not None and len(previous_gpu_ids) > 0
                     and len(previous_gpu_ids) != self._world_size):
                 # TODO, should we modify the iteration?
-                if (self.auto_scale_lr is None
-                        or not self.auto_scale_lr.get('enable', False)):
+                if self.auto_scale_lr is None or not self.auto_scale_lr.get(
+                        'enable', False):
                     raise RuntimeError(
                         'Number of GPUs used for current experiment is not '
                         'consistent with the checkpoint being resumed from. '
@@ -2077,8 +2122,8 @@ class Runner:
         # resume optimizer
         if 'optimizer' in checkpoint and resume_optimizer:
             self.optim_wrapper = self.build_optim_wrapper(self.optim_wrapper)
-            self.optim_wrapper.load_state_dict(  # type: ignore
-                checkpoint['optimizer'])
+            self.optim_wrapper.load_state_dict(
+                checkpoint['optimizer'])  # type: ignore
 
         # resume param scheduler
         if resume_param_scheduler and self.param_schedulers is None:
@@ -2097,18 +2142,21 @@ class Runner:
             else:
                 for scheduler, ckpt_scheduler in zip(
                         self.param_schedulers,  # type: ignore
-                        checkpoint['param_schedulers']):
+                        checkpoint['param_schedulers'],
+                ):
                     scheduler.load_state_dict(ckpt_scheduler)
 
         self._has_loaded = True
 
         self.logger.info(f'resumed epoch: {self.epoch}, iter: {self.iter}')
 
-    def load_checkpoint(self,
-                        filename: str,
-                        map_location: Union[str, Callable] = 'cpu',
-                        strict: bool = False,
-                        revise_keys: list = [(r'^module.', '')]):
+    def load_checkpoint(
+        self,
+        filename: str,
+        map_location: Union[str, Callable] = 'cpu',
+        strict: bool = False,
+        revise_keys: list = [(r'^module.', '')],
+    ):
         """Load checkpoint from given ``filename``.
 
         Args:
@@ -2199,7 +2247,9 @@ class Runner:
         if file_client_args is not None:
             warnings.warn(
                 '"file_client_args" will be deprecated in future. '
-                'Please use "backend_args" instead', DeprecationWarning)
+                'Please use "backend_args" instead',
+                DeprecationWarning,
+            )
             if backend_args is not None:
                 raise ValueError(
                     '"file_client_args" and "backend_args" cannot be set at '
@@ -2216,7 +2266,8 @@ class Runner:
             seed=self.seed,
             experiment_name=self.experiment_name,
             time=time.strftime('%Y%m%d_%H%M%S', time.localtime()),
-            mmengine_version=mmengine.__version__ + get_git_hash())
+            mmengine_version=mmengine.__version__ + get_git_hash(),
+        )
 
         if hasattr(self.train_dataloader.dataset, 'metainfo'):
             meta.update(dataset_meta=self.train_dataloader.dataset.metainfo)
@@ -2232,15 +2283,20 @@ class Runner:
             'state_dict':
             weights_to_cpu(model.state_dict()),
             'message_hub':
-            apply_to(self.message_hub.state_dict(),
-                     lambda x: hasattr(x, 'cpu'), lambda x: x.cpu()),
+            apply_to(
+                self.message_hub.state_dict(),
+                lambda x: hasattr(x, 'cpu'),
+                lambda x: x.cpu(),
+            ),
         }
         # save optimizer state dict to checkpoint
         if save_optimizer:
             if isinstance(self.optim_wrapper, OptimWrapper):
                 checkpoint['optimizer'] = apply_to(
                     self.optim_wrapper.state_dict(),
-                    lambda x: hasattr(x, 'cpu'), lambda x: x.cpu())
+                    lambda x: hasattr(x, 'cpu'),
+                    lambda x: x.cpu(),
+                )
             else:
                 raise TypeError(
                     'self.optim_wrapper should be an `OptimWrapper` '
@@ -2272,7 +2328,8 @@ class Runner:
             checkpoint,
             filepath,
             file_client_args=file_client_args,
-            backend_args=backend_args)
+            backend_args=backend_args,
+        )
 
     @master_only
     def dump_config(self) -> None:
@@ -2401,10 +2458,11 @@ class Runner:
             # compile=True, use default configurations
             compile_cfg = dict()
 
-        assert digit_version(TORCH_VERSION) >= digit_version('2.0.0'), (
-            'PyTorch >= 2.0.0 is required to enable torch.compile')
-        assert isinstance(compile_cfg, dict), (
-            f'`compile` should be a dict or bool, got {type(compile_cfg)}')
+        assert digit_version(TORCH_VERSION) >= digit_version(
+            '2.0.0'), 'PyTorch >= 2.0.0 is required to enable torch.compile'
+        assert isinstance(
+            compile_cfg, dict
+        ), f'`compile` should be a dict or bool, got {type(compile_cfg)}'
 
         func = getattr(self.model, target)
         compiled_func = torch.compile(func, **compile_cfg)
