@@ -1192,7 +1192,7 @@ class DVCLiveVisBackend(BaseVisBackend):
         try:
             path = pygit2.discover_repository(os.fspath(os.curdir), True, '')
             pygit2.Repository(path).default_signature
-        except KeyError:
+        except (KeyError, pygit2.GitError):
             os.system('dvc init -f --no-scm')
 
         if self._init_kwargs is None:
