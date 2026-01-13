@@ -1,10 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.distributed as torch_dist
 import torch.nn as nn
-from torch.testing._internal.common_distributed import DistributedTestBase
+
+try:
+    from torch.testing._internal.common_distributed import DistributedTestBase
+except ImportError:
+    pytest.skip(
+        'DistributedTestBase not available in this PyTorch version',
+        allow_module_level=True)
 
 from mmengine.dist import all_gather
 from mmengine.hooks import SyncBuffersHook
